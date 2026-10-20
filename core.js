@@ -16,12 +16,19 @@ export const ASSUMED_MISS = 30; // 세트 기록이 없을 때 예상 완주일�
 export const REVIEW_SCOPES = [
   ['all', '전체'],
   ['seen', '지금까지 본 단어'],
+  ['gichul', '기출'],
+  ['N5', 'N5'],
+  ['N4', 'N4'],
   ['N3', 'N3'],
   ['N2', 'N2'],
   ['weak', '약점'],
 ];
 
-export function buildIndex(data) {
+/**
+ * data: words.json (tanos N5~N2, 공개).
+ * gichul: 기출 파일 (개인용, 기기 안에만) — { tags: {id: [[급수, 유형]]}, words: [기출에만 있는 단어], pairs: {id: [id]} }
+ */
+export function buildIndex(data, gichul = null) {
   const level = new Map(data.books.map((b) => [b.id, b.level]));
   const byId = new Map();
   const levelOf = new Map();
@@ -29,7 +36,15 @@ export function buildIndex(data) {
     byId.set(w.id, w);
     levelOf.set(w.id, level.get(w.book));
   }
-  return { byId, levelOf, order: data.words.map((w) => w.id) };
+  const order = data.words.map((w) => w.id);
+  for (const w of gichul?.words ?? []) {
+    byId.set(w.id, w);
+    levelOf.set(w.id, '기출');
+    order.push(w.id);
+  }
+  const tags = new Map(Object.entries(gichul?.tags ?? {}).filter(([id]) => byId.has(id)));
+  const pairs = new Map(Object.entries(gichul?.pairs ?? {}).filter(([id]) => byId.has(id)));
+  return { byId, levelOf, order, tags, pairs, extra: gichul?.words?.length ?? 0 };
 }
 
 export function newState() {
@@ -85,20 +100,42 @@ export function shuffle(list, rng = Math.random) {
   return a;
 }
 
-/** 새 단어 순서를 만들거나, 단어장이 바뀐 만큼 맞춘다 (없어진 단어는 빼고 새 단어는 뒤에 섞어 붙임). */
+/**
+ * 새 단어 순서를 만들거나, 단어장이 바뀐 만큼 맞춘다.
+ * 없어진 단어는 빼고, 새로 생긴 단어는 아직 안 꺼낸 단어들과 함께 다시 섞는다 (N4·N5 추가가 뒤로 몰리지 않게).
+ * 그다음 기출 단어를 안 꺼낸 구간의 맨 앞으로 모은다 — 순서는 그대로 두는 안정 분할이라 몇 번 불러도 같다.
+ */
 export function ensureDeck(state, idx, rng = Math.random) {
   const d = state.deck;
   if (!d.order.length) {
     d.order = shuffle(idx.order, rng);
     d.next = 0;
-    return;
+  } else {
+    const used = d.order.slice(0, d.next).filter((id) => idx.byId.has(id));
+    let rest = d.order.slice(d.next).filter((id) => idx.byId.has(id));
+    const known = new Set(d.order);
+    const added = idx.order.filter((id) => !known.has(id));
+    if (added.length) rest = shuffle([...rest, ...added], rng);
+    d.order = [...used, ...rest];
+    d.next = used.length;
   }
-  const used = d.order.slice(0, d.next).filter((id) => idx.byId.has(id));
-  const rest = d.order.slice(d.next).filter((id) => idx.byId.has(id));
-  const known = new Set(d.order);
-  const added = idx.order.filter((id) => !known.has(id));
-  d.order = [...used, ...rest, ...shuffle(added, rng)];
-  d.next = used.length;
+  if (idx.tags?.size) {
+    const rest = d.order.slice(d.next);
+    const first = rest.filter((id) => idx.tags.has(id));
+    d.order = [...d.order.slice(0, d.next), ...first, ...rest.filter((id) => !idx.tags.has(id))];
+  }
+}
+
+/** 단어장에서 사라진 단어(기출 파일을 지운 경우 등)를 진행 중인 세트·넘어온 단어에서 뺀다. */
+export function pruneState(state, idx, rng = Math.random) {
+  const ok = (id) => idx.byId.has(id);
+  state.carry = state.carry.filter(ok);
+  const s = state.set;
+  if (!s) return;
+  for (const k of ['pending', 'retry', 'ids', 'missed']) s[k] = s[k].filter(ok);
+  const n = (tag) => s.ids.filter((id) => s.tags[id] === tag).length;
+  s.comp = { carry: n('carry'), fresh: n('new'), confuse: n('confuse') };
+  if (!s.pending.length && advance(s, rng)) state.set = null;
 }
 
 // ── 첫눈 기록 ──────────────────────────────────────────
@@ -282,6 +319,7 @@ export function reviewIds(state, idx, scope) {
   if (scope === 'all') return idx.order;
   if (scope === 'seen') return idx.order.filter((id) => state.words[id]?.last);
   if (scope === 'weak') return weakIds(state, idx);
+  if (scope === 'gichul') return idx.order.filter((id) => idx.tags.has(id));
   return idx.order.filter((id) => idx.levelOf.get(id) === scope);
 }
 

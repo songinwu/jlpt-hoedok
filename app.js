@@ -1,10 +1,11 @@
 import {
   ASSUMED_MISS, REVIEW_SCOPES, SETS_PER_DAY, WEAK_ENTER, WEAK_LEAVE, answerReview, answerSet, answerWeak, buildIndex, ensureDeck,
-  finishDate, newState, openWeak, planNextSet, restoreState, reviewCurrent, reviewIds, startReview, startSet, stats,
-  today, weakIds,
+  finishDate, newState, openWeak, planNextSet, pruneState, restoreState, reviewCurrent, reviewIds, startReview, startSet,
+  stats, today, weakIds,
 } from './core.js';
 
 const STORE_KEY = 'jlpt-hoedok-v1'; // 키는 그대로 두고 안의 version으로 형식을 구분한다 (v1 → v2 자동 이전)
+const GICHUL_KEY = 'jlpt-hoedok-gichul'; // 기출 파일(책 내용) — 이 기기 안에만, 저장소에는 없다
 const HANGUL = /[가-힣]/;
 const SCOPE_LABEL = Object.fromEntries(REVIEW_SCOPES);
 const TAG_LABEL = { carry: '지난 세트에서 넘어옴', confuse: '헷갈림 복습' };
@@ -12,7 +13,8 @@ const $app = document.getElementById('app');
 const $modal = document.getElementById('modal');
 const $toast = document.getElementById('toast');
 
-let idx; // 단어장 색인
+let idx; // 단어장 색인 (words.json + 기출 파일)
+let wordsData; // words.json 원본 — 기출 파일을 넣고 뺄 때 색인을 다시 만든다
 let state; // 진도 (localStorage)
 let undoStack = []; // { hash, snap } — 답하기 직전 상태 전체
 let revealed = false;
@@ -159,12 +161,14 @@ function renderHome() {
     : '새 단어를 모두 봤어요. 이제 세트는 넘어온·헷갈림 단어로 채워져요.';
   const r = state.review;
   const weakCount = weakIds(state, idx).length;
+  const gichulLeft = idx.tags.size ? state.deck.order.slice(state.deck.next).filter((id) => idx.tags.has(id)).length : 0;
+  const sub = `N5~N2 ${num(st.total - idx.extra)}단어${idx.extra ? ` + 기출 ${num(idx.extra)}` : ''}`;
 
   $app.innerHTML = `
     <header class="home-head">
       <div>
         <h1>JLPT 회독</h1>
-        <p class="sub">N3·N2 ${num(st.total)}단어</p>
+        <p class="sub">${sub}</p>
       </div>
       <span class="dday">${dday()}</span>
       <button class="icon" data-act="settings" aria-label="설정">⚙︎</button>
@@ -177,7 +181,7 @@ function renderHome() {
       <span class="chips">${chips}</span>
       ${set ? `<span class="bar"><i style="width:${Math.round(((setTotal - remaining) / setTotal) * 100)}%"></i></span>` : ''}
     </button>
-    <p class="pace">${pace}</p>
+    <p class="pace">${pace}${gichulLeft ? `<br>기출 단어 <b>${num(gichulLeft)}</b>개가 먼저 나와요` : ''}</p>
 
     <h2>복습</h2>
     <div class="tiles">
@@ -203,12 +207,19 @@ function wordClass(word) {
 
 function cardHtml(w, show, tag) {
   const noteJa = w.note && !HANGUL.test(w.note) ? `<p class="note" lang="ja">${esc(w.note)}</p>` : '';
-  const meta = [w.pos, idx.levelOf.get(w.id), w.note && HANGUL.test(w.note) ? w.note : '', tag].filter(Boolean).map(esc).join(' · ');
+  const level = idx.levelOf.get(w.id);
+  const meta = [w.pos, level === '기출' ? '' : level, w.note && HANGUL.test(w.note) ? w.note : '', tag]
+    .filter(Boolean).map(esc).join(' · ');
+  const tags = idx.tags.get(w.id);
+  const gichul = tags ? `<p class="gichul">기출 ${esc(tags.map(([lv, sec]) => `${lv} ${sec}`).join(' · '))}</p>` : '';
+  const pair = (idx.pairs.get(w.id) ?? []).map((id) => idx.byId.get(id)?.word).filter(Boolean);
   const back = show
     ? `<div class="back">
         ${w.reading !== w.word ? `<p class="reading" lang="ja">${esc(w.reading)}</p>` : ''}
         <p class="meaning">${esc(w.meaning)}</p>
+        ${pair.length ? `<p class="pair">≒ <span lang="ja">${esc(pair.join('・'))}</span></p>` : ''}
         <p class="pos">${meta}</p>
+        ${gichul}
       </div>`
     : '<p class="hint">탭하면 읽기·뜻</p>';
   return `
@@ -450,6 +461,15 @@ function showSettings() {
     ${check('glasses', '안경 — 뜻 항상 보기')}
     ${check('autoSpeak', '자동 발음 (뜻이 보일 때)')}
     <label class="row"><span>시험일</span><input type="date" data-set="examDate" value="${esc(s.examDate)}"></label>
+    <h3>기출 단어장 (개인용)</h3>
+    <p class="help">${idx.tags.size
+      ? `불러옴 — 기출 ${num(idx.tags.size)}개 (단어장에 없던 ${num(idx.extra)}개 추가). 새 단어 순서 맨 앞에 와요.`
+      : 'PC에서 만든 기출 파일(gichul.json)을 불러오면 기출 단어가 먼저 나와요.'}
+    이 파일은 이 기기 안에만 저장돼요.</p>
+    <div class="row-btns">
+      <label class="btn">${idx.tags.size ? '다시 불러오기' : '파일 불러오기'}<input type="file" accept="application/json,.json" data-act="import-gichul" hidden></label>
+      ${idx.tags.size ? '<button class="btn danger" data-act="remove-gichul">기출 지우기</button>' : ''}
+    </div>
     <h3>백업</h3>
     <p class="help">진도는 이 기기의 브라우저에만 저장돼요. 가끔 내보내 두세요.</p>
     <div class="row-btns">
@@ -472,6 +492,39 @@ function exportBackup() {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+function loadGichul() {
+  try {
+    const obj = JSON.parse(localStorage.getItem(GICHUL_KEY) || 'null');
+    return obj?.app === 'jlpt-hoedok-gichul' ? obj : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 기출 파일을 넣거나(obj) 빼고(null) 색인·덱을 다시 맞춘다. */
+function applyGichul(obj) {
+  idx = buildIndex(wordsData, obj);
+  pruneState(state, idx);
+  ensureDeck(state, idx);
+  undoStack = [];
+  save();
+  closeModal();
+  go('#/');
+}
+
+async function importGichul(file) {
+  try {
+    const text = await file.text();
+    const obj = JSON.parse(text);
+    if (obj?.app !== 'jlpt-hoedok-gichul') throw new Error('형식');
+    localStorage.setItem(GICHUL_KEY, text);
+    applyGichul(obj);
+    toast(`기출 ${num(idx.tags.size)}개를 불러왔어요`);
+  } catch {
+    toast('기출 파일이 아니거나 저장하지 못했어요');
+  }
 }
 
 async function importBackup(file) {
@@ -537,6 +590,13 @@ function handleAct(act, el) {
       fn?.();
       break;
     }
+    case 'remove-gichul':
+      confirmBox('기출 단어장을 이 기기에서 지울까요? 기출에만 있던 단어는 세트에서 빠지고, 진도 기록은 남아요.', '지우기', () => {
+        localStorage.removeItem(GICHUL_KEY);
+        applyGichul(null);
+        toast('기출 단어장을 지웠어요');
+      });
+      break;
     case 'reset-all':
       confirmBox('세트·리뷰·약점 책 기록을 모두 지울까요? 되돌릴 수 없어요.', '모두 지우기', () => {
         const settings = state.settings;
@@ -566,7 +626,7 @@ $app.addEventListener('click', (e) => {
 $modal.addEventListener('click', (e) => {
   if (e.target === $modal) return closeModal();
   const el = e.target.closest('[data-act]');
-  if (el && el.dataset.act !== 'import') handleAct(el.dataset.act, el);
+  if (el && !el.dataset.act.startsWith('import')) handleAct(el.dataset.act, el);
 });
 
 $modal.addEventListener('change', (e) => {
@@ -577,6 +637,8 @@ $modal.addEventListener('change', (e) => {
     if (route() === 'home') renderHome();
   } else if (e.target.dataset.act === 'import' && e.target.files[0]) {
     importBackup(e.target.files[0]);
+  } else if (e.target.dataset.act === 'import-gichul' && e.target.files[0]) {
+    importGichul(e.target.files[0]);
   }
 });
 
@@ -649,11 +711,13 @@ async function init() {
   state = load();
   try {
     const res = await fetch('./words.json');
-    idx = buildIndex(await res.json());
+    wordsData = await res.json();
   } catch {
     $app.innerHTML = '<p class="loading">단어장을 불러오지 못했어요. 새로고침해 보세요.</p>';
     return;
   }
+  idx = buildIndex(wordsData, loadGichul());
+  pruneState(state, idx);
   ensureDeck(state, idx);
   save();
   render();
