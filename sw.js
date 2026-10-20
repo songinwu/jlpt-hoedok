@@ -1,6 +1,6 @@
 // 오프라인용 — 캐시에 있으면 바로 쓰고, 뒤에서 새 판을 받아 다음 실행 때 반영한다 (stale-while-revalidate).
 // 파일 목록이 바뀌면 VERSION을 올린다.
-const VERSION = 'hoedok-2026-10-20.1';
+const VERSION = 'hoedok-2026-10-20.3';
 const SHELL = [
   './',
   './index.html',
@@ -14,7 +14,9 @@ const SHELL = [
 ];
 
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  // cache: 'reload' — GitHub Pages가 붙이는 HTTP 캐시(10분)를 건너뛰고 새 판을 받는다
+  const fresh = SHELL.map((url) => new Request(url, { cache: 'reload' }));
+  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(fresh)).then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', (e) => {
@@ -31,7 +33,7 @@ self.addEventListener('fetch', (e) => {
   e.respondWith(
     caches.open(VERSION).then(async (cache) => {
       const cached = await cache.match(req, { ignoreSearch: true });
-      const fresh = fetch(req)
+      const fresh = fetch(req, { cache: 'no-cache' })
         .then((res) => {
           if (res.ok) cache.put(req, res.clone());
           return res;
