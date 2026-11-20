@@ -111,19 +111,25 @@ async function syncNow({ manual = false } = {}) {
       return;
     }
     const plan = syncPlan(state, remote, base);
+    // base는 「원격에 실제로 올라간 버전의 updatedAt」이어야 한다. 올리는 동안 답을 더 누르면
+    // state.updatedAt이 앞서 나가므로, 끝난 뒤의 state 값을 쓰면 다음 번에 자기 버전을 다른 기기 버전으로 오인한다.
+    let synced = remote?.updatedAt ?? base;
     if (plan === 'pull') {
       adoptState(remote);
+      synced = remote.updatedAt;
       toast('다른 기기 진도를 받았어요');
     } else if (plan === 'merge') {
       const merged = mergeStates(state, remote);
       merged.updatedAt = Date.now();
       await pushRemote(token, gistId, merged);
       adoptState(merged);
+      synced = merged.updatedAt;
       toast('두 기기 진도를 합쳤어요');
     } else if (plan === 'push') {
+      synced = state.updatedAt; // pushRemote는 부르는 순간 내용을 굳히므로 이 값이 올라간 버전이다
       await pushRemote(token, gistId, state);
     }
-    syncCfg = { ...syncCfg, base: state.updatedAt, at: Date.now() };
+    syncCfg = { ...syncCfg, base: synced, at: Date.now() };
     saveSyncCfg(syncCfg);
     syncStatus = '';
     if (manual) toast(plan === 'none' ? '이미 최신이에요' : '동기화했어요');
