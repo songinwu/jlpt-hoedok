@@ -1,8 +1,9 @@
 import {
   ASSUMED_MISS, REVIEW_SCOPES, SETS_PER_DAY, WEAK_ENTER, WEAK_LEAVE, answerReview, answerSet, answerWeak, buildIndex, ensureDeck,
-  finishDate, newState, openWeak, planNextSet, pruneState, restoreState, reviewCurrent, reviewIds, startReview, startSet,
-  stats, today, weakIds,
+  finishDate, mergeStates, newState, openWeak, planNextSet, pruneState, restoreState, reviewCurrent, reviewIds, startReview, startSet,
+  stats, syncPlan, today, unknownDeckIds, weakIds,
 } from './core.js';
+import { createGist, findGist, loadSyncCfg, pullRemote, pushRemote, saveSyncCfg } from './sync.js';
 
 const STORE_KEY = 'jlpt-hoedok-v1'; // 키는 그대로 두고 안의 version으로 형식을 구분한다 (v1 → v2 자동 이전)
 const GICHUL_KEY = 'jlpt-hoedok-gichul'; // 기출 파일(책 내용) — 이 기기 안에만, 저장소에는 없다
@@ -20,6 +21,7 @@ let undoStack = []; // { hash, snap } — 답하기 직전 상태 전체
 let revealed = false;
 let saveFailed = false;
 let afterNav = null; // 화면 이동이 끝난 뒤 띄울 창
+let lastSaved = null; // 마지막 저장 내용(updatedAt 제외) — 실제로 바뀌었을 때만 updatedAt을 올린다
 
 // ── 저장 ────────────────────────────────────────────────
 
@@ -29,13 +31,26 @@ function load() {
     const parsed = raw ? JSON.parse(raw) : null;
     // 책 방식(v1) 진도는 새 방식으로 옮길 때 사라지는 부분이 있어 원본을 따로 남겨 둔다
     if (parsed?.version === 1 && !localStorage.getItem(`${STORE_KEY}-old`)) localStorage.setItem(`${STORE_KEY}-old`, raw);
-    return restoreState(parsed);
+    const s = restoreState(parsed);
+    lastSaved = bodyOf(s);
+    return s;
   } catch {
     return newState();
   }
 }
 
+function bodyOf(s) {
+  const { updatedAt, ...rest } = s;
+  return JSON.stringify(rest);
+}
+
 function save() {
+  const body = bodyOf(state);
+  if (body !== lastSaved) {
+    state.updatedAt = Date.now();
+    lastSaved = body;
+    scheduleSync();
+  }
   try {
     localStorage.setItem(STORE_KEY, JSON.stringify(state));
     saveFailed = false;
@@ -43,6 +58,126 @@ function save() {
     if (!saveFailed) toast('저장에 실패했어요. 설정 → 백업 내보내기를 해 두세요.', 4000);
     saveFailed = true;
   }
+}
+
+// ── 동기화 ──────────────────────────────────────────────
+// 앱을 열 때·다시 볼 때·인터넷이 돌아올 때 받고, 진도가 바뀌면 조금 기다렸다 올린다.
+
+let syncCfg = loadSyncCfg();
+let syncing = false;
+let syncAgain = false;
+let syncTimer = null;
+let syncFirstDirty = 0;
+let syncStatus = ''; // 설정 화면에 보여 줄 마지막 결과
+
+function scheduleSync() {
+  if (!syncCfg) return;
+  const now = Date.now();
+  syncFirstDirty ||= now;
+  clearTimeout(syncTimer);
+  // 답을 계속 누르는 동안에는 5초 쉬면 올리고, 쉬지 않아도 30초마다는 올린다
+  const wait = Math.max(0, Math.min(5000, syncFirstDirty + 30000 - now));
+  syncTimer = setTimeout(() => syncNow(), wait);
+}
+
+/** 원격 진도를 이 기기에 적용한다 (pull·merge 공용). */
+function adoptState(next) {
+  state = restoreState(next);
+  pruneState(state, idx);
+  ensureDeck(state, idx);
+  lastSaved = bodyOf(state);
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch { /* 다음 저장 때 다시 */ }
+  undoStack = [];
+  revealed = false;
+  if (!$modal.hidden && $modal.querySelector('[data-sync]')) showSettings();
+  else go('#/');
+}
+
+async function syncNow({ manual = false } = {}) {
+  if (!syncCfg || !idx) return;
+  if (syncing) {
+    syncAgain = true;
+    return;
+  }
+  syncing = true;
+  clearTimeout(syncTimer);
+  syncFirstDirty = 0;
+  try {
+    const { token, gistId, base } = syncCfg;
+    const remote = await pullRemote(token, gistId);
+    if (remote && unknownDeckIds(remote, idx)) {
+      syncStatus = '기출 단어장이 이 기기에 없어서 멈췄어요. 설정 → 기출 단어장을 먼저 불러와 주세요.';
+      if (manual) toast(syncStatus, 4000);
+      return;
+    }
+    const plan = syncPlan(state, remote, base);
+    if (plan === 'pull') {
+      adoptState(remote);
+      toast('다른 기기 진도를 받았어요');
+    } else if (plan === 'merge') {
+      const merged = mergeStates(state, remote);
+      merged.updatedAt = Date.now();
+      await pushRemote(token, gistId, merged);
+      adoptState(merged);
+      toast('두 기기 진도를 합쳤어요');
+    } else if (plan === 'push') {
+      await pushRemote(token, gistId, state);
+    }
+    syncCfg = { ...syncCfg, base: state.updatedAt, at: Date.now() };
+    saveSyncCfg(syncCfg);
+    syncStatus = '';
+    if (manual) toast(plan === 'none' ? '이미 최신이에요' : '동기화했어요');
+  } catch (e) {
+    syncStatus = e.status === 401 ? '토큰이 만료됐거나 틀렸어요. 끊고 다시 연결해 주세요.'
+      : e.status === 404 ? '진도 gist를 찾지 못했어요. 끊고 다시 연결해 주세요.'
+      : navigator.onLine === false ? '인터넷이 없어서 미뤘어요. 연결되면 다시 해요.'
+      : `동기화 실패 (${e.message})`;
+    if (manual) toast(syncStatus, 4000);
+  } finally {
+    syncing = false;
+    if (syncAgain) {
+      syncAgain = false;
+      syncNow();
+    }
+  }
+}
+
+async function connectSync(token) {
+  token = token.trim();
+  if (!token) return toast('토큰을 붙여 넣어 주세요');
+  toast('연결하는 중…', 5000);
+  try {
+    let gistId = await findGist(token);
+    const created = !gistId;
+    if (created) gistId = await createGist(token, state);
+    syncCfg = { token, gistId, base: created ? state.updatedAt : null, at: created ? Date.now() : 0 };
+    saveSyncCfg(syncCfg);
+    if (!created) await syncNow({ manual: true });
+    else toast('연결했어요. 다른 기기에서도 같은 토큰으로 연결하세요.', 3500);
+    showSettings();
+  } catch (e) {
+    syncCfg = null;
+    toast(e.status === 401 ? '토큰이 맞지 않아요' : e.status === 403 || e.status === 404 ? '토큰에 gist 권한이 없어요' : '연결하지 못했어요. 인터넷을 확인해 주세요.', 4000);
+  }
+}
+
+function syncSection() {
+  if (!syncCfg) {
+    return `
+    <h3>기기 간 동기화</h3>
+    <p class="help">GitHub 토큰(gist 권한만)을 넣으면 비공개 gist에 진도를 올려 폰과 PC가 같은 진도를 써요. 두 기기에 같은 토큰을 넣으면 돼요.</p>
+    <input type="password" id="sync-token" class="wide-input" placeholder="ghp_… 토큰" autocomplete="off" data-sync>
+    <button class="btn wide" data-act="sync-connect">연결</button>`;
+  }
+  const when = syncCfg.at ? new Date(syncCfg.at).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '아직 없음';
+  return `
+    <h3>기기 간 동기화</h3>
+    <p class="help" data-sync>연결됨 · 마지막 동기화 ${esc(when)}${syncStatus ? `<br>⚠️ ${esc(syncStatus)}` : ''}<br>
+    앱을 열 때 받고, 진도가 바뀌면 몇 초 뒤 올려요. 기출 단어장은 올리지 않아요.</p>
+    <div class="row-btns">
+      <button class="btn" data-act="sync-now">지금 동기화</button>
+      <button class="btn danger" data-act="sync-off">연결 끊기</button>
+    </div>`;
 }
 
 // ── 공통 ────────────────────────────────────────────────
@@ -470,8 +605,9 @@ function showSettings() {
       <label class="btn">${idx.tags.size ? '다시 불러오기' : '파일 불러오기'}<input type="file" accept="application/json,.json" data-act="import-gichul" hidden></label>
       ${idx.tags.size ? '<button class="btn danger" data-act="remove-gichul">기출 지우기</button>' : ''}
     </div>
+    ${syncSection()}
     <h3>백업</h3>
-    <p class="help">진도는 이 기기의 브라우저에만 저장돼요. 가끔 내보내 두세요.</p>
+    <p class="help">진도는 이 기기의 브라우저에 저장돼요. 가끔 내보내 두세요.</p>
     <div class="row-btns">
       <button class="btn" data-act="export">내보내기</button>
       <label class="btn">불러오기<input type="file" accept="application/json,.json" data-act="import" hidden></label>
@@ -583,6 +719,16 @@ function handleAct(act, el) {
     case 'autospeak': toggleSetting('autoSpeak'); break;
     case 'mode-menu': showModeMenu(); break;
     case 'export': exportBackup(); break;
+    case 'sync-connect': connectSync(document.getElementById('sync-token')?.value ?? ''); break;
+    case 'sync-now': syncNow({ manual: true }).then(() => { if (!$modal.hidden) showSettings(); }); break;
+    case 'sync-off':
+      confirmBox('이 기기의 동기화 연결을 끊을까요? 진도와 gist는 그대로 남아요.', '끊기', () => {
+        syncCfg = null;
+        saveSyncCfg(null);
+        syncStatus = '';
+        toast('연결을 끊었어요');
+      });
+      break;
     case 'confirm-ok': {
       const fn = pendingConfirm;
       pendingConfirm = null;
@@ -721,6 +867,12 @@ async function init() {
   ensureDeck(state, idx);
   save();
   render();
+  syncNow();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') syncNow();
+    else if (syncFirstDirty) syncNow(); // 앱을 내릴 때 밀린 진도를 올린다
+  });
+  window.addEventListener('online', () => syncNow());
   navigator.storage?.persist?.();
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
     navigator.serviceWorker.register('./sw.js').catch(() => {});

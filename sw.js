@@ -1,12 +1,13 @@
 // 오프라인용 — 캐시에 있으면 바로 쓰고, 뒤에서 새 판을 받아 다음 실행 때 반영한다 (stale-while-revalidate).
 // 파일 목록이 바뀌면 VERSION을 올린다.
-const VERSION = 'hoedok-2026-10-20.4';
+const VERSION = 'hoedok-2026-11-20.1';
 const SHELL = [
   './',
   './index.html',
   './style.css',
   './app.js',
   './core.js',
+  './sync.js',
   './words.json',
   './manifest.webmanifest',
   './icons/icon-192.png',

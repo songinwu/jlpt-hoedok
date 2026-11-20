@@ -62,6 +62,7 @@ export function newState() {
     words: {}, // id → { miss, weak, streak, last, reviewMiss }
     tick: 0, // 첫눈 답마다 1씩 — '오래 안 본' 순서용
     daily: {}, // 'YYYY-MM-DD' → { k, s, sets }
+    updatedAt: 0, // 마지막으로 내용이 바뀐 시각(ms) — 기기 간 동기화용
   };
 }
 
@@ -148,6 +149,7 @@ function record(state, id, known, ctx) {
   const w = wordStat(state, id);
   state.tick += 1;
   w.last = state.tick;
+  w.at = Date.now(); // 동기화 병합용 — 두 기기에서 같은 단어를 봤으면 나중 기록을 쓴다
   w.reviewMiss = ctx === 'review' && !known; // 리뷰에서 모르면 헷갈림 1순위, 다른 데서 다시 보면 푼다
   const events = [];
   if (known) {
@@ -382,4 +384,55 @@ export function finishDate(state, idx, now = new Date()) {
   const days = sets <= todaySlots ? 0 : Math.ceil((sets - todaySlots) / SETS_PER_DAY);
   const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + days);
   return { date: d, sets, perSet, assumed: !log.length };
+}
+
+// ── 기기 간 동기화 ──────────────────────────────────────
+//
+// base = 마지막으로 동기화가 끝났을 때의 updatedAt (양쪽이 같은 값). 이걸 기준으로 누가 바뀌었는지 본다.
+
+/** 'none' | 'pull'(원격으로 바꿈) | 'push'(원격에 올림) | 'merge'(둘 다 바뀜 → 합쳐서 올림) */
+export function syncPlan(local, remote, base) {
+  if (!remote) return 'push';
+  const lu = local.updatedAt ?? 0;
+  const ru = remote.updatedAt ?? 0;
+  if (base == null) {
+    // 처음 연결: 한쪽이 빈 진도면 다른 쪽을 그대로 쓴다
+    if (!local.tick) return remote.tick ? 'pull' : lu === ru ? 'none' : 'push';
+    if (!remote.tick) return 'push';
+    return lu === ru ? 'none' : 'merge';
+  }
+  const lc = lu !== base;
+  const rc = ru !== base;
+  if (lc && rc) return 'merge';
+  if (rc) return 'pull';
+  if (lc) return 'push';
+  return 'none';
+}
+
+/**
+ * 두 기기 진도 합치기. 세트·리뷰·약점 책 진행과 덱 위치는 나중에 바뀐 쪽을 그대로 쓰고,
+ * 단어 기록은 단어마다 나중 기록(at)을, 날짜별 기록은 칸마다 큰 값을 쓴다.
+ */
+export function mergeStates(local, remote) {
+  const L = restoreState(local);
+  const R = restoreState(remote);
+  const [base, other] = (R.updatedAt ?? 0) > (L.updatedAt ?? 0) ? [R, L] : [L, R];
+  const out = structuredClone(base);
+  for (const [id, w] of Object.entries(other.words)) {
+    const mine = out.words[id];
+    if (!mine || (w.at ?? 0) > (mine.at ?? 0)) out.words[id] = { ...w };
+  }
+  for (const [day, v] of Object.entries(other.daily)) {
+    const d = out.daily[day];
+    out.daily[day] = d ? { k: Math.max(d.k, v.k), s: Math.max(d.s, v.s), sets: Math.max(d.sets, v.sets) } : { ...v };
+  }
+  out.tick = Math.max(L.tick, R.tick);
+  out.setsDone = Math.max(L.setsDone, R.setsDone);
+  out.updatedAt = Math.max(L.updatedAt ?? 0, R.updatedAt ?? 0);
+  return out;
+}
+
+/** 이 기기 단어장에 없는 단어가 덱에 몇 개 있나 — 기출 파일을 한쪽에만 불러온 경우 */
+export function unknownDeckIds(state, idx) {
+  return (state?.deck?.order ?? []).filter((id) => !idx.byId.has(id)).length;
 }

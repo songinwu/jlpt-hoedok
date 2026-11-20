@@ -350,3 +350,4 @@ h2 { margin: 24px 0 8px; color: var(--muted); font-size: 13px; font-weight: 700;
 .wl-word { font-weight: 700; font-size: 17px; }
 .wl-reading { color: var(--know); font-size: 13px; }
 .wl-meaning { color: var(--muted); font-size: 13px; }
+.wide-input { display: block; width: 100%; box-sizing: border-box; margin-top: 8px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); color: var(--text); font: inherit; }
