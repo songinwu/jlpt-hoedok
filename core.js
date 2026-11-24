@@ -22,7 +22,7 @@ export const REVIEW_SCOPES = [
   ['N3', 'N3'],
   ['N2', 'N2'],
   ['weak', '약점'],
-  ['focus', '한권 N2'],
+  ['focus', '한권 N3·N2'],
 ];
 
 /**

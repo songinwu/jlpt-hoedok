@@ -12,6 +12,8 @@ const SCOPE_LABEL = Object.fromEntries(REVIEW_SCOPES);
 const TAG_LABEL = { carry: '지난 세트에서 넘어옴', confuse: '헷갈림 복습' };
 /** 집중 단어장 파일이 있으면 그 책의 뜻을 보여 준다 */
 const meaningOf = (w) => idx.focus?.meaning.get(w.id) ?? w.meaning;
+/** 'N3 DAY 05' 같은 글자는 그대로, 옛 파일의 숫자는 'DAY 05'로 */
+const dayLabel = (d) => (d == null ? '' : typeof d === 'number' ? `DAY ${String(d).padStart(2, '0')}` : d);
 const $app = document.getElementById('app');
 const $modal = document.getElementById('modal');
 const $toast = document.getElementById('toast');
@@ -312,7 +314,7 @@ function renderHome() {
     ? `${esc(idx.focus.title)} ${num(idx.focus.ids.length)}단어만 보는 중`
     : `N5~N2 ${num(st.total - idx.extra)}단어${idx.extra ? ` + 기출 ${num(idx.extra)}` : ''}`;
   const focusLine = focus
-    ? `<br>${esc(idx.focus.title)} <b>${num(focusDone)}</b>/${num(idx.focus.ids.length)}${nextDay ? ` · 다음 세트는 DAY ${nextDay}부터` : ''}`
+    ? `<br>${esc(idx.focus.title)} <b>${num(focusDone)}</b>/${num(idx.focus.ids.length)}${nextDay ? ` · 다음 세트는 ${esc(dayLabel(nextDay))}부터` : ''}`
     : '';
 
   $app.innerHTML = `
@@ -360,7 +362,7 @@ function cardHtml(w, show, tag) {
   const noteJa = w.note && !HANGUL.test(w.note) ? `<p class="note" lang="ja">${esc(w.note)}</p>` : '';
   const level = idx.levelOf.get(w.id);
   const dayNo = idx.focus?.day.get(w.id);
-  const meta = [w.pos, level === '기출' || level === '한권' ? '' : level, dayNo ? `DAY ${String(dayNo).padStart(2, '0')}` : '',
+  const meta = [w.pos, level === '기출' || level === '한권' ? '' : level, dayLabel(dayNo),
     w.note && HANGUL.test(w.note) ? w.note : '', tag]
     .filter(Boolean).map(esc).join(' · ');
   const tags = idx.tags.get(w.id);
