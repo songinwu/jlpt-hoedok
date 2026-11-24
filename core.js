@@ -22,6 +22,7 @@ export const REVIEW_SCOPES = [
   ['N3', 'N3'],
   ['N2', 'N2'],
   ['weak', '약점'],
+  ['focus', '한권 N2'],
 ];
 
 /**
@@ -39,19 +40,41 @@ export function buildIndex(data, gichul = null) {
   const order = data.words.map((w) => w.id);
   for (const w of gichul?.words ?? []) {
     byId.set(w.id, w);
-    levelOf.set(w.id, '기출');
+    levelOf.set(w.id, w.id.startsWith('h-') ? '한권' : '기출');
     order.push(w.id);
   }
   const tags = new Map(Object.entries(gichul?.tags ?? {}).filter(([id]) => byId.has(id)));
   const pairs = new Map(Object.entries(gichul?.pairs ?? {}).filter(([id]) => byId.has(id)));
-  return { byId, levelOf, order, tags, pairs, extra: gichul?.words?.length ?? 0 };
+  // 집중 단어장(한권으로 끝내기 N2 DAY 순서) — 켜 두면 세트·헷갈림·약점 책이 이 단어들로만 돈다
+  const f = gichul?.focus;
+  const focus = f?.ids?.length
+    ? {
+        title: f.title ?? '집중 단어장',
+        ids: f.ids.filter((id) => byId.has(id)),
+        set: new Set(f.ids),
+        day: new Map(Object.entries(f.day ?? {})),
+        meaning: new Map(Object.entries(f.meaning ?? {})),
+      }
+    : null;
+  return { byId, levelOf, order, tags, pairs, focus, extra: gichul?.words?.length ?? 0 };
+}
+
+/** 집중 단어장 모드인가 (파일에 focus가 있고 설정에서 끄지 않았을 때) */
+export function focusOn(state, idx) {
+  return !!idx.focus && state.settings.focusOnly !== false;
+}
+
+/** 지금 새 단어를 꺼내는 덱 — 집중 모드면 DAY 순서 덱, 아니면 전체 덱 */
+export function activeDeck(state, idx) {
+  return focusOn(state, idx) ? state.focusDeck : state.deck;
 }
 
 export function newState() {
   return {
     version: STATE_VERSION,
-    settings: { glasses: false, autoSpeak: false, examDate: '2026-12-06' },
+    settings: { glasses: false, autoSpeak: false, examDate: '2026-12-06', focusOnly: true },
     deck: { order: [], next: 0 }, // 새 단어 순서(섞음)와 다음에 꺼낼 위치
+    focusDeck: { order: [], next: 0 }, // 집중 단어장 순서(DAY 순, 섞지 않음)와 다음에 꺼낼 위치
     set: null, // 진행 중인 세트
     setsDone: 0,
     missLog: [], // 최근 세트들의 넘어간 단어 수 — 예상 완주일용
@@ -124,6 +147,14 @@ export function ensureDeck(state, idx, rng = Math.random) {
     const rest = d.order.slice(d.next);
     const first = rest.filter((id) => idx.tags.has(id));
     d.order = [...d.order.slice(0, d.next), ...first, ...rest.filter((id) => !idx.tags.has(id))];
+  }
+  if (idx.focus) {
+    // 꺼낸 단어는 그대로, 나머지는 파일의 DAY 순서대로 (파일을 다시 불러와도 진도가 유지된다)
+    const f = (state.focusDeck ??= { order: [], next: 0 });
+    const used = f.order.slice(0, f.next).filter((id) => idx.focus.set.has(id) && idx.byId.has(id));
+    const usedSet = new Set(used);
+    f.order = [...used, ...idx.focus.ids.filter((id) => !usedSet.has(id))];
+    f.next = used.length;
   }
 }
 
@@ -214,8 +245,9 @@ function confuseScore(state, w) {
 /** 헷갈림 단어: 리뷰에서 모름 → 약점 → 모른 횟수 → 오래 안 본 순. 본 적 있는 단어만, 직전 세트는 뺀다. */
 export function pickConfusing(state, idx, n, exclude = new Set()) {
   const prev = new Set(state.prevSet);
+  const only = focusOn(state, idx) ? idx.focus.set : null;
   const cands = Object.entries(state.words).filter(
-    ([id, w]) => w.last && idx.byId.has(id) && !exclude.has(id) && !prev.has(id),
+    ([id, w]) => w.last && idx.byId.has(id) && !exclude.has(id) && !prev.has(id) && (!only || only.has(id)),
   );
   cands.sort((a, b) => confuseScore(state, b[1]) - confuseScore(state, a[1]) || a[0].localeCompare(b[0]));
   return cands.slice(0, n).map(([id]) => id);
@@ -223,14 +255,16 @@ export function pickConfusing(state, idx, n, exclude = new Set()) {
 
 /** 다음 세트 구성 미리보기 — 상태를 바꾸지 않는다. */
 export function planNextSet(state, idx) {
-  const carry = [...new Set(state.carry)].filter((id) => idx.byId.has(id));
-  const left = state.deck.order.length - state.deck.next;
+  const only = focusOn(state, idx) ? idx.focus.set : null;
+  const carry = [...new Set(state.carry)].filter((id) => idx.byId.has(id) && (!only || only.has(id)));
+  const deck = activeDeck(state, idx);
+  const left = deck.order.length - deck.next;
   const nConfuse = left > 0 ? SET_CONFUSE : Math.max(SET_CONFUSE, SET_TARGET - carry.length);
   // 전체 리뷰에서 먼저 본 단어가 곧 새 단어로 나올 수 있으니 그 구간도 뺀다 (한 세트에 두 번 들어가지 않게)
-  const upcoming = state.deck.order.slice(state.deck.next, state.deck.next + SET_TARGET);
+  const upcoming = deck.order.slice(deck.next, deck.next + SET_TARGET);
   const confuse = pickConfusing(state, idx, nConfuse, new Set([...carry, ...upcoming]));
   const nFresh = Math.min(left, Math.max(SET_MIN_NEW, SET_TARGET - carry.length - confuse.length));
-  const fresh = state.deck.order.slice(state.deck.next, state.deck.next + nFresh);
+  const fresh = deck.order.slice(deck.next, deck.next + nFresh);
   return { carry, fresh, confuse };
 }
 
@@ -241,7 +275,7 @@ export function startSet(state, idx, rng = Math.random) {
   for (const id of plan.confuse) tags[id] = 'confuse';
   for (const id of plan.carry) tags[id] = 'carry';
   const ids = Object.keys(tags);
-  state.deck.next += plan.fresh.length;
+  activeDeck(state, idx).next += plan.fresh.length;
   state.carry = [];
   state.set = {
     no: state.setsDone + 1,
@@ -280,7 +314,8 @@ export function answerSet(state, idx, known, { rng = Math.random, now = new Date
 // ── 약점 책 ─────────────────────────────────────────────
 
 export function weakIds(state, idx) {
-  return idx.order.filter((id) => state.words[id]?.weak);
+  const only = focusOn(state, idx) ? idx.focus.set : null;
+  return idx.order.filter((id) => state.words[id]?.weak && (!only || only.has(id)));
 }
 
 /** 약점 책을 열 때 진행 상태를 만들거나, 들어오고 나간 단어만큼 맞춘다. */
@@ -322,6 +357,7 @@ export function reviewIds(state, idx, scope) {
   if (scope === 'seen') return idx.order.filter((id) => state.words[id]?.last);
   if (scope === 'weak') return weakIds(state, idx);
   if (scope === 'gichul') return idx.order.filter((id) => idx.tags.has(id));
+  if (scope === 'focus') return idx.focus?.ids ?? [];
   return idx.order.filter((id) => idx.levelOf.get(id) === scope);
 }
 
@@ -365,7 +401,8 @@ export function stats(state, idx) {
     if (w.last) seen += 1;
     if (w.weak) weak += 1;
   }
-  return { total: idx.byId.size, seen, weak, newLeft: state.deck.order.length - state.deck.next };
+  const deck = activeDeck(state, idx);
+  return { total: idx.byId.size, seen, weak, newLeft: deck.order.length - deck.next };
 }
 
 /**
@@ -373,7 +410,8 @@ export function stats(state, idx) {
  * 세트당 새 단어 = 100 − 헷갈림 10 − 넘어오는 단어(최근 세트 평균, 기록이 없으면 ASSUMED_MISS로 가정).
  */
 export function finishDate(state, idx, now = new Date()) {
-  const left = state.deck.order.length - state.deck.next;
+  const deck = activeDeck(state, idx);
+  const left = deck.order.length - deck.next;
   if (left <= 0) return null;
   const log = state.missLog ?? [];
   const miss = log.length ? log.reduce((a, b) => a + b, 0) / log.length : ASSUMED_MISS;
@@ -434,5 +472,6 @@ export function mergeStates(local, remote) {
 
 /** 이 기기 단어장에 없는 단어가 덱에 몇 개 있나 — 기출 파일을 한쪽에만 불러온 경우 */
 export function unknownDeckIds(state, idx) {
-  return (state?.deck?.order ?? []).filter((id) => !idx.byId.has(id)).length;
+  const ids = [...(state?.deck?.order ?? []), ...(state?.focusDeck?.order ?? [])];
+  return ids.filter((id) => !idx.byId.has(id)).length;
 }
