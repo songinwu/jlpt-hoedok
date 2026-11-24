@@ -1,6 +1,6 @@
 import {
   ASSUMED_MISS, REVIEW_SCOPES, SETS_PER_DAY, WEAK_ENTER, WEAK_LEAVE, answerReview, answerSet, answerWeak, buildIndex, ensureDeck,
-  finishDate, focusOn, mergeStates, newState, openWeak, planNextSet, pruneState, restoreState, reviewCurrent, reviewIds, startReview, startSet,
+  finishDate, focusBook, focusOn, mergeStates, trackOf, newState, openWeak, planNextSet, pruneState, restoreState, reviewCurrent, reviewIds, startReview, startSet,
   stats, syncPlan, today, unknownDeckIds, weakIds,
 } from './core.js';
 import { createGist, findGist, loadSyncCfg, pullRemote, pushRemote, saveSyncCfg } from './sync.js';
@@ -10,8 +10,14 @@ const GICHUL_KEY = 'jlpt-hoedok-gichul'; // 기출 파일(책 내용) — 이 �
 const HANGUL = /[가-힣]/;
 const SCOPE_LABEL = Object.fromEntries(REVIEW_SCOPES);
 const TAG_LABEL = { carry: '지난 세트에서 넘어옴', confuse: '헷갈림 복습' };
-/** 집중 단어장 파일이 있으면 그 책의 뜻을 보여 준다 */
-const meaningOf = (w) => idx.focus?.meaning.get(w.id) ?? w.meaning;
+/** 집중 단어장 파일이 있으면 그 책의 뜻을 보여 준다 (지금 돌리는 책 → 다른 책 → 원래 뜻) */
+function meaningOf(w) {
+  const books = idx.focus?.books ?? [];
+  const cur = focusBook(idx, routeKey());
+  for (const b of cur ? [cur, ...books] : books) if (b.meaning.has(w.id)) return b.meaning.get(w.id);
+  return w.meaning;
+}
+const daysOf = (id) => (idx.focus?.books ?? []).map((b) => dayLabel(b.day.get(id))).filter(Boolean).join(' · ');
 /** 'N3 DAY 05' 같은 글자는 그대로, 옛 파일의 숫자는 'DAY 05'로 */
 const dayLabel = (d) => (d == null ? '' : typeof d === 'number' ? `DAY ${String(d).padStart(2, '0')}` : d);
 const $app = document.getElementById('app');
@@ -237,16 +243,16 @@ function speak(text) {
 
 const MODES = {
   set: {
-    active: () => !!state.set,
-    title: () => `세트 ${state.set.no}`,
-    current: () => state.set.pending[0] ?? null,
+    active: () => !!T().set,
+    title: () => `${focusBook(idx, routeKey())?.title ?? ''} 세트 ${T().set.no}`.trim(),
+    current: () => T().set.pending[0] ?? null,
     progress() {
-      const s = state.set;
+      const s = T().set;
       const remaining = s.pending.length + s.retry.length;
       return { done: s.ids.length - remaining, total: s.ids.length, label: `${s.pass > 1 ? `${s.pass}바퀴 · ` : ''}남은 ${remaining}/${s.ids.length}` };
     },
-    tag: (id) => TAG_LABEL[state.set.tags[id]] ?? '',
-    answer: (known) => answerSet(state, idx, known),
+    tag: (id) => TAG_LABEL[T().set.tags[id]] ?? '',
+    answer: (known) => answerSet(state, idx, known, { key: routeKey() }),
   },
   weak: {
     active: () => true,
@@ -276,9 +282,18 @@ const MODES = {
 };
 
 function route() {
-  const m = location.hash.match(/^#\/(set|weak|review)$/);
-  return m ? m[1] : 'home';
+  const m = location.hash.match(/^#\/(set|weak|review)(?:-(\w+))?$/);
+  return m && (m[1] === 'set' || !m[2]) ? m[1] : 'home';
 }
+
+/** 세트 화면의 책 key ('#/set-N3' → 'N3'). 전체 단어장 세트('#/set')는 null */
+function routeKey() {
+  return location.hash.match(/^#\/set-(\w+)$/)?.[1] ?? null;
+}
+
+/** 지금 화면의 세트 트랙 */
+const T = () => trackOf(state, routeKey());
+const setHash = (key) => (key ? `#/set-${key}` : '#/set');
 
 function render() {
   const mode = route();
@@ -293,29 +308,15 @@ function renderHome() {
   if (location.hash && location.hash !== '#/') history.replaceState(null, '', '#/');
   const st = stats(state, idx);
   const day = state.daily[today()] ?? { k: 0, s: 0, sets: 0 };
-  const set = state.set;
-  const comp = set ? set.comp : (({ carry, fresh, confuse }) => ({ carry: carry.length, fresh: fresh.length, confuse: confuse.length }))(planNextSet(state, idx));
-  const setTotal = set ? set.ids.length : comp.carry + comp.fresh + comp.confuse;
-  const remaining = set ? set.pending.length + set.retry.length : setTotal;
-  const chips = [['넘어온', comp.carry], ['새', comp.fresh], ['헷갈림', comp.confuse]]
-    .filter(([, n]) => n).map(([k, n]) => `<span class="chip">${k} ${n}</span>`).join('');
-  const fin = finishDate(state, idx);
-  const pace = fin
-    ? `하루 ${SETS_PER_DAY}세트면 <b>${fin.date.getMonth() + 1}월 ${fin.date.getDate()}일</b>에 새 단어를 다 봐요 · 남은 새 단어 ${num(st.newLeft)}`
-      + (fin.assumed ? ` · 세트마다 ${ASSUMED_MISS}개씩 넘어간다고 가정` : ` · 세트당 새 단어 약 ${fin.perSet}개`)
-    : '새 단어를 모두 봤어요. 이제 세트는 넘어온·헷갈림 단어로 채워져요.';
   const r = state.review;
   const weakCount = weakIds(state, idx).length;
   const focus = focusOn(state, idx);
-  const gichulLeft = !focus && idx.tags.size ? state.deck.order.slice(state.deck.next).filter((id) => idx.tags.has(id)).length : 0;
-  const focusDone = focus ? state.focusDeck.next : 0;
-  const nextDay = focus ? idx.focus.day.get(state.focusDeck.order[state.focusDeck.next]) : null;
   const sub = focus
-    ? `${esc(idx.focus.title)} ${num(idx.focus.ids.length)}단어만 보는 중`
+    ? `${esc(idx.focus.title)} ${idx.focus.books.map((b) => `${esc(b.key)} ${num(b.ids.length)}`).join(' · ')}만 보는 중`
     : `N5~N2 ${num(st.total - idx.extra)}단어${idx.extra ? ` + 기출 ${num(idx.extra)}` : ''}`;
-  const focusLine = focus
-    ? `<br>${esc(idx.focus.title)} <b>${num(focusDone)}</b>/${num(idx.focus.ids.length)}${nextDay ? ` · 다음 세트는 ${esc(dayLabel(nextDay))}부터` : ''}`
-    : '';
+  const sections = focus
+    ? idx.focus.books.map((b) => `<h2>${esc(b.title)}</h2>${setSection(b.key)}`).join('')
+    : setSection(null);
 
   $app.innerHTML = `
     <header class="home-head">
@@ -328,13 +329,7 @@ function renderHome() {
     </header>
     <p class="today">오늘 <b>${day.sets}</b>세트 · <b>${num(day.k + day.s)}</b>장 · 처음 본 단어 <b>${num(st.seen)}</b>/${num(st.total)} · 약점 <b>${st.weak}</b></p>
 
-    <button class="hero" data-act="go-set">
-      <span class="hero-title">${set ? `세트 ${set.no} 이어하기` : `세트 ${state.setsDone + 1} 시작`}</span>
-      <span class="hero-count">${set ? `남은 ${remaining}/${setTotal}` : `${setTotal}장`}</span>
-      <span class="chips">${chips}</span>
-      ${set ? `<span class="bar"><i style="width:${Math.round(((setTotal - remaining) / setTotal) * 100)}%"></i></span>` : ''}
-    </button>
-    <p class="pace">${pace}${gichulLeft ? `<br>기출 단어 <b>${num(gichulLeft)}</b>개가 먼저 나와요` : ''}${focusLine}</p>
+    ${sections}
 
     <h2>복습</h2>
     <div class="tiles">
@@ -351,6 +346,39 @@ function renderHome() {
     <p class="credit">단어 tanos.co.uk (Jonathan Waller, CC BY) · 한국어 뜻 Claude 작성</p>`;
 }
 
+/** 세트 시작 버튼 + 진도 한 줄. key가 없으면 전체 단어장, 있으면 그 책 */
+function setSection(key) {
+  const t = trackOf(state, key);
+  const set = t.set;
+  const comp = set ? set.comp : (({ carry, fresh, confuse }) => ({ carry: carry.length, fresh: fresh.length, confuse: confuse.length }))(planNextSet(state, idx, key));
+  const setTotal = set ? set.ids.length : comp.carry + comp.fresh + comp.confuse;
+  const remaining = set ? set.pending.length + set.retry.length : setTotal;
+  const chips = [['넘어온', comp.carry], ['새', comp.fresh], ['헷갈림', comp.confuse]]
+    .filter(([, n]) => n).map(([k, n]) => `<span class="chip">${k} ${n}</span>`).join('');
+  const left = t.deck.order.length - t.deck.next;
+  const fin = finishDate(state, idx, new Date(), key);
+  let pace = fin
+    ? `하루 ${SETS_PER_DAY}세트면 <b>${fin.date.getMonth() + 1}월 ${fin.date.getDate()}일</b>에 새 단어를 다 봐요 · 남은 새 단어 ${num(left)}`
+      + (fin.assumed ? ` · 세트마다 ${ASSUMED_MISS}개씩 넘어간다고 가정` : ` · 세트당 새 단어 약 ${fin.perSet}개`)
+    : '새 단어를 모두 봤어요. 이제 세트는 넘어온·헷갈림 단어로 채워져요.';
+  const book = focusBook(idx, key);
+  if (book) {
+    const nextDay = book.day.get(t.deck.order[t.deck.next]);
+    pace += `<br>${num(t.deck.next)}/${num(book.ids.length)}${nextDay ? ` · 다음 세트는 ${esc(dayLabel(nextDay))}부터` : ''}`;
+  } else if (idx.tags.size) {
+    const gichulLeft = t.deck.order.slice(t.deck.next).filter((id) => idx.tags.has(id)).length;
+    if (gichulLeft) pace += `<br>기출 단어 <b>${num(gichulLeft)}</b>개가 먼저 나와요`;
+  }
+  return `
+    <button class="hero" data-act="go-set" data-key="${esc(key ?? '')}">
+      <span class="hero-title">${set ? `세트 ${set.no} 이어하기` : `세트 ${t.setsDone + 1} 시작`}</span>
+      <span class="hero-count">${set ? `남은 ${remaining}/${setTotal}` : `${setTotal}장`}</span>
+      <span class="chips">${chips}</span>
+      ${set ? `<span class="bar"><i style="width:${Math.round(((setTotal - remaining) / setTotal) * 100)}%"></i></span>` : ''}
+    </button>
+    <p class="pace">${pace}</p>`;
+}
+
 // ── 카드 화면 ────────────────────────────────────────────
 
 function wordClass(word) {
@@ -361,8 +389,7 @@ function wordClass(word) {
 function cardHtml(w, show, tag) {
   const noteJa = w.note && !HANGUL.test(w.note) ? `<p class="note" lang="ja">${esc(w.note)}</p>` : '';
   const level = idx.levelOf.get(w.id);
-  const dayNo = idx.focus?.day.get(w.id);
-  const meta = [w.pos, level === '기출' || level === '한권' ? '' : level, dayLabel(dayNo),
+  const meta = [w.pos, level === '기출' || level === '한권' ? '' : level, daysOf(w.id),
     w.note && HANGUL.test(w.note) ? w.note : '', tag]
     .filter(Boolean).map(esc).join(' · ');
   const tags = idx.tags.get(w.id);
@@ -411,7 +438,7 @@ function renderStudy(mode) {
   const pct = prog.total ? Math.round((prog.done / prog.total) * 100) : 0;
   const show = revealed || state.settings.glasses;
   const { glasses, autoSpeak } = state.settings;
-  const canUndo = undoStack.at(-1)?.hash === `#/${mode}`;
+  const canUndo = undoStack.at(-1)?.hash === location.hash;
   $app.innerHTML = `
     <div class="study">
       <header class="topbar">
@@ -454,7 +481,7 @@ function doAnswer(known) {
   const snap = JSON.stringify(state);
   const res = MODES[cur.mode].answer(known);
   if (!res) return;
-  undoStack.push({ hash: `#/${cur.mode}`, snap });
+  undoStack.push({ hash: location.hash, snap });
   if (undoStack.length > 20) undoStack.shift();
   save();
   for (const e of res.events) {
@@ -492,12 +519,12 @@ function toggleSetting(key) {
   toast(`${{ glasses: '안경', autoSpeak: '자동 발음' }[key]} ${state.settings[key] ? '켜짐' : '꺼짐'}`);
 }
 
-function beginSet() {
-  if (!state.set) {
-    startSet(state, idx);
+function beginSet(key = null) {
+  if (!trackOf(state, key).set) {
+    startSet(state, idx, undefined, key);
     save();
   }
-  go('#/set');
+  go(setHash(key));
 }
 
 // ── 모달 ────────────────────────────────────────────────
@@ -581,9 +608,9 @@ function showReviewScopes() {
 function showModeMenu() {
   const mode = route();
   if (mode === 'set') {
-    const c = state.set.comp;
+    const c = T().set.comp;
     openModal(`
-      <h2>세트 ${state.set.no}</h2>
+      <h2>${esc(MODES.set.title())}</h2>
       <p>넘어온 단어 <b>${c.carry}</b> · 새 단어 <b>${c.fresh}</b> · 헷갈림 <b>${c.confuse}</b></p>
       <p class="help">세트를 끝까지 하면 처음 봤을 때 모른 단어가 전부 다음 세트로 넘어가요.
       나갔다 와도 이어서 할 수 있어요.</p>
@@ -621,8 +648,9 @@ function showSettings() {
       ? `불러옴 — 기출 ${num(idx.tags.size)}개 (단어장에 없던 ${num(idx.extra)}개 추가). 새 단어 순서 맨 앞에 와요.`
       : 'PC에서 만든 기출 파일(gichul.json)을 불러오면 기출 단어가 먼저 나와요.'}
     이 파일은 이 기기 안에만 저장돼요.</p>
-    ${idx.focus ? `${check('focusOnly', `${esc(idx.focus.title)} 단어만 보기 (${num(idx.focus.ids.length)}개, DAY 순서)`)}
-    <p class="help">켜 두면 세트의 새 단어·넘어온 단어·헷갈림, 약점 책이 이 책 단어로만 나와요. 끄면 전체 단어장으로 돌아가고, 각자 어디까지 봤는지는 따로 저장돼요.</p>` : ''}
+    ${idx.focus ? `${check('focusOnly', `${esc(idx.focus.title)} 단어만 보기 (${idx.focus.books.map((b) => `${esc(b.key)} ${num(b.ids.length)}`).join(' · ')})`)}
+    <p class="help">켜 두면 목록에 책마다 세트가 따로 생기고, DAY 순서로 새 단어가 나와요. 넘어온 단어·헷갈림은 그 책 단어로만, 약점 책은 두 책 단어로만 나와요.
+    끄면 전체 단어장 세트로 돌아가고, 각자 어디까지 봤는지는 따로 저장돼요.</p>` : ''}
     <div class="row-btns">
       <label class="btn">${idx.tags.size ? '다시 불러오기' : '파일 불러오기'}<input type="file" accept="application/json,.json" data-act="import-gichul" hidden></label>
       ${idx.tags.size ? '<button class="btn danger" data-act="remove-gichul">기출 지우기</button>' : ''}
@@ -679,7 +707,7 @@ async function importGichul(file) {
     if (obj?.app !== 'jlpt-hoedok-gichul') throw new Error('형식');
     localStorage.setItem(GICHUL_KEY, text);
     applyGichul(obj);
-    toast(`기출 ${num(idx.tags.size)}개${idx.focus ? ` + ${idx.focus.title} ${num(idx.focus.ids.length)}개` : ''}를 불러왔어요`);
+    toast(`기출 ${num(idx.tags.size)}개${idx.focus ? ` + ${idx.focus.title} ${idx.focus.books.map((b) => `${b.key} ${num(b.ids.length)}`).join(' · ')}` : ''}를 불러왔어요`);
   } catch {
     toast('기출 파일이 아니거나 저장하지 못했어요');
   }
@@ -709,7 +737,7 @@ function handleAct(act, el) {
     case 'home': go('#/'); break;
     case 'close': closeModal(); break;
     case 'settings': showSettings(); break;
-    case 'go-set': closeModal(); beginSet(); break;
+    case 'go-set': closeModal(); beginSet(el.dataset.key || null); break;
     case 'go-weak': go('#/weak'); break;
     case 'go-review':
       if (state.review) go('#/review');
