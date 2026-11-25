@@ -228,38 +228,37 @@ function dday() {
   return n > 0 ? `D-${n}` : n === 0 ? 'D-DAY' : `D+${-n}`;
 }
 
-// iPhone 무음 스위치 우회 — 음성 읽기는 기본으로 「벨소리」 채널이라 무음 모드에서 꺼진다.
-// ① 오디오 세션을 「재생」으로 (Safari 17+), ② 소리 없는 <audio>를 같이 틀어 미디어 재생 채널로 붙인다.
-let silentAudio = null;
-function silentWavUrl(seconds = 1) {
-  const rate = 8000;
-  const n = rate * seconds;
-  const buf = new ArrayBuffer(44 + n);
-  const v = new DataView(buf);
-  const str = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
-  str(0, 'RIFF'); v.setUint32(4, 36 + n, true); str(8, 'WAVE'); str(12, 'fmt ');
-  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-  v.setUint32(24, rate, true); v.setUint32(28, rate, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true);
-  str(36, 'data'); v.setUint32(40, n, true);
-  new Uint8Array(buf, 44).fill(128); // 8비트 무음
-  return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+// 발음 — 미리 만든 mp3(app/audio, scripts/make_audio.py)를 <audio>로 튼다.
+// iPhone은 무음 스위치가 켜져 있으면 음성 읽기(speechSynthesis)를 막지만, 음성 파일 재생은 막지 않는다.
+// 파일이 없거나 못 틀면 음성 읽기로 대신한다.
+
+/** make_audio.py audio_key()와 같은 FNV-1a 32비트 해시 */
+function audioKey(text) {
+  let h = 0x811c9dc5;
+  for (const b of new TextEncoder().encode(text)) {
+    h ^= b;
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, '0');
 }
 
-function unlockAudio() {
-  try {
-    if (navigator.audioSession) navigator.audioSession.type = 'playback';
-  } catch { /* 지원 안 하면 넘어감 */ }
-  try {
-    silentAudio ??= Object.assign(new Audio(silentWavUrl()), { playsInline: true });
-    silentAudio.currentTime = 0;
-    silentAudio.play().catch(() => {});
-  } catch { /* 넘어감 */ }
+let player = null;
+function speak(reading) {
+  const text = (reading ?? '').replace(/[～〜]/g, '').trim();
+  if (!text) return;
+  speechSynthesis?.cancel?.();
+  player ??= new Audio();
+  player.pause();
+  player.src = `./audio/${audioKey(text)}.mp3`;
+  // play()는 버튼을 누른 그 순간에 불러야 iPhone이 허락한다 — 기다리지 않고 바로 부른다
+  player.play().catch((e) => {
+    if (e?.name !== 'AbortError') speakTts(text); // 다음 단어로 넘어가며 끊긴 것은 대신 읽지 않는다
+  });
 }
 
-function speak(text) {
-  if (!('speechSynthesis' in window) || !text) return;
-  unlockAudio();
-  const u = new SpeechSynthesisUtterance(text.replace(/[～〜]/g, ''));
+function speakTts(text) {
+  if (!('speechSynthesis' in window)) return;
+  const u = new SpeechSynthesisUtterance(text);
   u.lang = 'ja-JP';
   u.rate = 0.9;
   const voice = speechSynthesis.getVoices().find((v) => v.lang?.startsWith('ja'));
