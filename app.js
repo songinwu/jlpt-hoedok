@@ -3,7 +3,10 @@ import {
   finishDate, focusBook, focusOn, mergeStates, trackOf, newState, openWeak, planNextSet, pruneState, restoreState, reviewCurrent, reviewIds, startReview, startSet,
   stats, syncPlan, today, unknownDeckIds, weakIds,
 } from './core.js';
-import { createGist, findGist, loadSyncCfg, pullRemote, pushRemote, saveSyncCfg } from './sync.js';
+import {
+  createGichulGist, createGist, findGichulGist, findGist, gichulVersion, loadSyncCfg, pullGichul, pullRemote, pushGichul, pushRemote,
+  saveSyncCfg,
+} from './sync.js';
 
 const STORE_KEY = 'jlpt-hoedok-v1'; // 키는 그대로 두고 안의 version으로 형식을 구분한다 (v1 → v2 자동 이전)
 const GICHUL_KEY = 'jlpt-hoedok-gichul'; // 기출 파일(책 내용) — 이 기기 안에만, 저장소에는 없다
@@ -103,8 +106,54 @@ function adoptState(next) {
   else go('#/');
 }
 
-async function syncNow({ manual = false } = {}) {
+/** 단어장 파일이 얼마나 새것인가 — 빌드 시각, 없으면 옛 파일끼리 구분 (책별 > 집중 1권 > 기출만) */
+function gichulRank(obj) {
+  return obj?.builtAt ?? (obj?.focus?.books ? 2 : obj?.focus ? 1 : obj ? 0.5 : 0);
+}
+
+/**
+ * 기출·집중 단어장 파일 맞추기. 원격 gist가 바뀌었을 때만 받고, 더 새것을 쪽으로 맞춘다.
+ * 진도 동기화보다 먼저 — 단어장이 다르면 진도 동기화가 멈추므로.
+ */
+async function syncGichul() {
+  const { token } = syncCfg;
+  const localText = localStorage.getItem(GICHUL_KEY);
+  const local = loadGichul();
+  let { gichulId, gichulVer } = syncCfg;
+  if (!gichulId) gichulId = await findGichulGist(token);
+  if (!gichulId) {
+    if (!local) return;
+    const g = await createGichulGist(token, localText);
+    syncCfg = { ...syncCfg, gichulId: g.id, gichulVer: g.version };
+    saveSyncCfg(syncCfg);
+    return;
+  }
+  const ver = await gichulVersion(token, gichulId);
+  let remoteRank = syncCfg.gichulRank ?? -1;
+  if (ver !== gichulVer || syncCfg.gichulId !== gichulId) {
+    const r = await pullGichul(token, gichulId);
+    const remote = r ? JSON.parse(r.text) : null;
+    remoteRank = gichulRank(remote);
+    if (remote?.app === 'jlpt-hoedok-gichul' && remoteRank > gichulRank(local)) {
+      localStorage.setItem(GICHUL_KEY, r.text);
+      applyGichul(remote, { quiet: true });
+      toast('다른 기기에서 단어장을 받았어요');
+    }
+    gichulVer = r?.version ?? ver;
+  }
+  if (local && gichulRank(local) > remoteRank) {
+    gichulVer = await pushGichul(token, gichulId, localText);
+    remoteRank = gichulRank(local);
+  }
+  syncCfg = { ...syncCfg, gichulId, gichulVer, gichulRank: remoteRank };
+  saveSyncCfg(syncCfg);
+}
+
+let gichulChecked = false; // 앱을 열거나 다시 볼 때만 단어장을 확인한다 (답할 때마다 하지 않게)
+
+async function syncNow({ manual = false, gichul = false } = {}) {
   if (!syncCfg || !idx) return;
+  if (gichul || manual) gichulChecked = false;
   if (syncing) {
     syncAgain = true;
     return;
@@ -113,10 +162,14 @@ async function syncNow({ manual = false } = {}) {
   clearTimeout(syncTimer);
   syncFirstDirty = 0;
   try {
+    if (!gichulChecked) {
+      await syncGichul();
+      gichulChecked = true;
+    }
     const { token, gistId, base } = syncCfg;
     const remote = await pullRemote(token, gistId);
     if (remote && unknownDeckIds(remote, idx)) {
-      syncStatus = '기출 단어장이 이 기기에 없어서 멈췄어요. 설정 → 기출 단어장을 먼저 불러와 주세요.';
+      syncStatus = '다른 기기의 단어장이 이 기기와 달라서 멈췄어요. 다른 기기에서 앱을 한 번 열어 단어장을 올린 뒤 「지금 동기화」를 눌러 주세요.';
       if (manual) toast(syncStatus, 4000);
       return;
     }
@@ -189,7 +242,7 @@ function syncSection() {
   return `
     <h3>기기 간 동기화</h3>
     <p class="help" data-sync>연결됨 · 마지막 동기화 ${esc(when)}${syncStatus ? `<br>⚠️ ${esc(syncStatus)}` : ''}<br>
-    앱을 열 때 받고, 진도가 바뀌면 몇 초 뒤 올려요. 기출 단어장은 올리지 않아요.</p>
+    앱을 열 때 받고, 진도가 바뀌면 몇 초 뒤 올려요. 기출·한권 단어장도 같이 맞춰요(더 새 파일 쪽으로).</p>
     <div class="row-btns">
       <button class="btn" data-act="sync-now">지금 동기화</button>
       <button class="btn danger" data-act="sync-off">연결 끊기</button>
@@ -675,7 +728,7 @@ function showSettings() {
     <p class="help">${idx.tags.size
       ? `불러옴 — 기출 ${num(idx.tags.size)}개 (단어장에 없던 ${num(idx.extra)}개 추가). 새 단어 순서 맨 앞에 와요.`
       : 'PC에서 만든 기출 파일(gichul.json)을 불러오면 기출 단어가 먼저 나와요.'}
-    이 파일은 이 기기 안에만 저장돼요.</p>
+    동기화를 연결해 두면 다른 기기에도 자동으로 넘어가요(비공개 gist). 공개 저장소에는 올라가지 않아요.</p>
     ${idx.focus ? `${check('focusOnly', `${esc(idx.focus.title)} 단어만 보기 (${idx.focus.books.map((b) => `${esc(b.key)} ${num(b.ids.length)}`).join(' · ')})`)}
     <p class="help">켜 두면 목록에 책마다 세트가 따로 생기고, DAY 순서로 새 단어가 나와요. 넘어온 단어·헷갈림은 그 책 단어로만, 약점 책은 두 책 단어로만 나와요.
     끄면 전체 단어장 세트로 돌아가고, 각자 어디까지 봤는지는 따로 저장돼요.</p>` : ''}
@@ -718,12 +771,13 @@ function loadGichul() {
 }
 
 /** 기출 파일을 넣거나(obj) 빼고(null) 색인·덱을 다시 맞춘다. */
-function applyGichul(obj) {
+function applyGichul(obj, { quiet = false } = {}) {
   idx = buildIndex(wordsData, obj);
   pruneState(state, idx);
   ensureDeck(state, idx);
   undoStack = [];
   save();
+  if (quiet) return render(); // 동기화로 받았을 때 — 보던 화면 그대로
   closeModal();
   go('#/');
 }
@@ -735,6 +789,7 @@ async function importGichul(file) {
     if (obj?.app !== 'jlpt-hoedok-gichul') throw new Error('형식');
     localStorage.setItem(GICHUL_KEY, text);
     applyGichul(obj);
+    syncNow({ gichul: true }); // 다른 기기로도 올린다 (더 새 파일일 때만)
     toast(`기출 ${num(idx.tags.size)}개${idx.focus ? ` + ${idx.focus.title} ${idx.focus.books.map((b) => `${b.key} ${num(b.ids.length)}`).join(' · ')}` : ''}를 불러왔어요`);
   } catch {
     toast('기출 파일이 아니거나 저장하지 못했어요');
@@ -945,12 +1000,12 @@ async function init() {
   ensureDeck(state, idx);
   save();
   render();
-  syncNow();
+  syncNow({ gichul: true });
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') syncNow();
+    if (document.visibilityState === 'visible') syncNow({ gichul: true });
     else if (syncFirstDirty) syncNow(); // 앱을 내릴 때 밀린 진도를 올린다
   });
-  window.addEventListener('online', () => syncNow());
+  window.addEventListener('online', () => syncNow({ gichul: true }));
   navigator.storage?.persist?.();
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
     navigator.serviceWorker.register('./sw.js').catch(() => {});
