@@ -228,8 +228,37 @@ function dday() {
   return n > 0 ? `D-${n}` : n === 0 ? 'D-DAY' : `D+${-n}`;
 }
 
+// iPhone 무음 스위치 우회 — 음성 읽기는 기본으로 「벨소리」 채널이라 무음 모드에서 꺼진다.
+// ① 오디오 세션을 「재생」으로 (Safari 17+), ② 소리 없는 <audio>를 같이 틀어 미디어 재생 채널로 붙인다.
+let silentAudio = null;
+function silentWavUrl(seconds = 1) {
+  const rate = 8000;
+  const n = rate * seconds;
+  const buf = new ArrayBuffer(44 + n);
+  const v = new DataView(buf);
+  const str = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  str(0, 'RIFF'); v.setUint32(4, 36 + n, true); str(8, 'WAVE'); str(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true);
+  str(36, 'data'); v.setUint32(40, n, true);
+  new Uint8Array(buf, 44).fill(128); // 8비트 무음
+  return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+}
+
+function unlockAudio() {
+  try {
+    if (navigator.audioSession) navigator.audioSession.type = 'playback';
+  } catch { /* 지원 안 하면 넘어감 */ }
+  try {
+    silentAudio ??= Object.assign(new Audio(silentWavUrl()), { playsInline: true });
+    silentAudio.currentTime = 0;
+    silentAudio.play().catch(() => {});
+  } catch { /* 넘어감 */ }
+}
+
 function speak(text) {
   if (!('speechSynthesis' in window) || !text) return;
+  unlockAudio();
   const u = new SpeechSynthesisUtterance(text.replace(/[～〜]/g, ''));
   u.lang = 'ja-JP';
   u.rate = 0.9;
