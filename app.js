@@ -295,14 +295,38 @@ function audioKey(text) {
   return h.toString(16).padStart(8, '0');
 }
 
+const speakText = (reading) => (reading ?? '').replace(/[～〜]/g, '').trim();
+
+// 지금 단어와 다음 몇 단어의 소리를 미리 받아 둔다 — 누르는 순간 받기 시작하면 늦게 나온다.
+// 받아 둔 것은 blob 주소로 틀어서, 서비스 워커 · Range 요청을 거치지 않고 바로 나온다.
+const preloaded = new Map(); // 파일 이름 → blob 주소 (받는 중이면 null)
+function preloadAudio(reading) {
+  const text = speakText(reading);
+  if (!text) return;
+  const key = audioKey(text);
+  if (preloaded.has(key)) return;
+  preloaded.set(key, null);
+  fetch(`./audio/${key}.mp3`)
+    .then((r) => (r.ok ? r.blob() : null))
+    .then((b) => (b ? preloaded.set(key, URL.createObjectURL(b)) : preloaded.delete(key)))
+    .catch(() => preloaded.delete(key));
+  for (const [k, u] of preloaded) {
+    if (preloaded.size <= 24) break;
+    if (u && player?.src === u) continue;
+    if (u) URL.revokeObjectURL(u);
+    preloaded.delete(k);
+  }
+}
+
 let player = null;
 function speak(reading) {
-  const text = (reading ?? '').replace(/[～〜]/g, '').trim();
+  const text = speakText(reading);
   if (!text) return;
   speechSynthesis?.cancel?.();
   player ??= new Audio();
   player.pause();
-  player.src = `./audio/${audioKey(text)}.mp3`;
+  const key = audioKey(text);
+  player.src = preloaded.get(key) || `./audio/${key}.mp3`;
   // play()는 버튼을 누른 그 순간에 불러야 iPhone이 허락한다 — 기다리지 않고 바로 부른다
   player.play().catch((e) => {
     if (e?.name !== 'AbortError') speakTts(text); // 다음 단어로 넘어가며 끊긴 것은 대신 읽지 않는다
@@ -327,6 +351,7 @@ const MODES = {
     active: () => !!T().set,
     title: () => `${focusBook(idx, routeKey())?.title ?? ''} 세트 ${T().set.no}`.trim(),
     current: () => T().set.pending[0] ?? null,
+    upcoming: () => T().set.pending.slice(1, 4),
     progress() {
       const s = T().set;
       const remaining = s.pending.length + s.retry.length;
@@ -340,6 +365,7 @@ const MODES = {
     open: () => openWeak(state, idx),
     title: () => '약점 책',
     current: () => state.weak?.pending[0] ?? null,
+    upcoming: () => state.weak?.pending.slice(1, 4) ?? [],
     progress() {
       const p = state.weak;
       const total = weakIds(state, idx).length;
@@ -501,6 +527,7 @@ function renderStudy(mode) {
   const title = M.title();
   document.title = `${title} — JLPT 회독`;
   const id = M.current();
+  for (const n of [id, ...(M.upcoming?.() ?? [])]) if (n) preloadAudio(idx.byId.get(n)?.reading);
   const back = '<button class="icon" data-act="home" aria-label="목록으로">‹</button>';
 
   if (!id) {
