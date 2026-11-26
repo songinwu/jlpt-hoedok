@@ -32,6 +32,11 @@
 
 * { box-sizing: border-box; }
 
+/* iPhone에서 빠르게 두 번 누르면 화면이 확대되던 것 — 두 번 눌러 확대만 끄고 스크롤 · 손가락 확대는 그대로 */
+html, button, a, input, label, select { touch-action: manipulation; }
+/* 글자가 16px보다 작은 입력칸을 누르면 iPhone이 확대한다 */
+input, select, textarea { font-size: max(16px, 1em); }
+
 body {
   margin: 0;
   background: var(--bg);
